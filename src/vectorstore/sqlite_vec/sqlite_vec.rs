@@ -1,5 +1,5 @@
 use std::{collections::HashMap, error::Error, sync::Arc};
-
+use std::fmt::Display;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::{Pool, Row, Sqlite};
@@ -17,7 +17,60 @@ pub struct Store {
     pub(crate) embedder: Arc<dyn Embedder>,
 }
 
-pub type SqliteOptions = VecStoreOptions<Value>;
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqliteFilter {
+    Eq(String, String),
+    Cmp(std::cmp::Ordering, String, String),
+    In(String, Vec<String>),
+    And(Vec<SqliteFilter>),
+    Or(Vec<SqliteFilter>),
+}
+
+impl Display for SqliteFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self {
+            SqliteFilter::Eq(a, b) => format!("json_extract(e.metadata, '$.{}') = {}", a.to_string(), b.to_string()),
+            SqliteFilter::Cmp(ordering, a, b) => {
+                let op = match ordering {
+                    std::cmp::Ordering::Less => "<",
+                    std::cmp::Ordering::Greater => ">",
+                    std::cmp::Ordering::Equal => "=",
+                };
+                format!("json_extract(e.metadata, '$.{}') {} {}", a.to_string(), op, b.to_string())
+            }
+            SqliteFilter::In(a, values) => {
+                format!(
+                    "json_extract(e.metadata, '$.{}') IN ({})",
+                    a.to_string(),
+                    values
+                        .iter()
+                        .map(|s| format!("'{}'", s))
+                        .collect::<Vec<String>>()
+                        .join(",")
+                )
+            }
+            SqliteFilter::And(filters) => filters
+                .iter()
+                .map(|filter| filter.to_string())
+                .collect::<Vec<String>>()
+                .join(" AND "),
+            SqliteFilter::Or(filters) => filters
+                .iter()
+                .map(|filter| filter.to_string())
+                .collect::<Vec<String>>()
+                .join(" OR "),
+        };
+        write!(f, "{}", str)
+    }
+}
+
+pub type SqliteOptions = VecStoreOptions<SqliteFilter>;
+
+impl Default for SqliteOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Store {
     pub async fn initialize(&self) -> Result<(), Box<dyn Error>> {
@@ -72,15 +125,10 @@ impl Store {
         Ok(())
     }
 
-    fn get_filters(&self, opt: &SqliteOptions) -> Result<HashMap<String, Value>, Box<dyn Error>> {
+    fn get_filters(&self, opt: &SqliteOptions) -> Result<String, Box<dyn Error>> {
         match &opt.filters {
-            Some(Value::Object(map)) => {
-                // Convert serde_json Map to HashMap<String, Value>
-                let filters = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                Ok(filters)
-            }
-            None => Ok(HashMap::new()), // No filters provided
-            _ => Err("Invalid filters format".into()), // Filters provided but not in the expected format
+            Some(filter) => Ok(filter.to_string()),
+            None => Ok("TRUE".to_string()),
         }
     }
 }
@@ -145,18 +193,7 @@ impl VectorStore for Store {
         let table = &self.table;
 
         let query_vector = json!(self.embedder.embed_query(query).await?);
-
         let filter = self.get_filters(opt)?;
-
-        let mut metadata_query = filter
-            .iter()
-            .map(|(k, v)| format!("json_extract(e.metadata, '$.{}') = '{}'", k, v))
-            .collect::<Vec<String>>()
-            .join(" AND ");
-
-        if metadata_query.is_empty() {
-            metadata_query = "TRUE".to_string();
-        }
 
         let rows = sqlx::query(&format!(
             r#"SELECT
@@ -165,7 +202,7 @@ impl VectorStore for Store {
                     distance
                 FROM {table} e
                 INNER JOIN vec_{table} v on v.rowid = e.rowid
-                WHERE v.text_embedding match '{query_vector}' AND k = ? AND {metadata_query}
+                WHERE v.text_embedding match '{query_vector}' AND k = ? AND {filter}
                 ORDER BY distance
                 LIMIT ?"#
         ))

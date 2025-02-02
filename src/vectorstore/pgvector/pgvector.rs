@@ -216,7 +216,7 @@ impl VectorStore for Store {
                 Vector::from(vector.into_iter().map(|x| *x as f32).collect::<Vec<f32>>());
 
             sqlx::query(&format!(
-                r#"INSERT INTO {} 
+                r#"INSERT INTO {}
 (uuid, document, embedding, cmetadata, collection_id) VALUES ($1, $2, $3, $4, $5)"#,
                 self.embedder_table_name
             ))
